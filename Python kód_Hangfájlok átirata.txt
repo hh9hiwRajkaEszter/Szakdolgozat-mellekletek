@@ -1,0 +1,118 @@
+import os
+import math
+import subprocess
+import sys
+import tempfile
+import shutil
+from openai import OpenAI
+
+
+OPENAI_API_KEY = ""   # API kulcs helye
+AUDIO_FILE = "input_audio/interju_1.m4a"             
+OUTPUT_FILE = "transcript.txt"
+CHUNK_MINUTES = 10                                  # 10 perces szeletek
+MODEL = "whisper-1"
+LANGUAGE = "hu"
+
+
+
+def which_or_die(cmd: str):
+    """Ellenőrzi, hogy ffmpeg/ffprobe elérhető-e a PATH-on."""
+    if shutil.which(cmd) is None:
+        print(f"❌ Hiba: '{cmd}' nem található a PATH-on. Telepítsd az FFmpeg-et és add a PATH-hoz.")
+        sys.exit(1)
+
+
+def get_duration_seconds(input_path: str) -> float:
+    """Visszaadja a fájl hosszát másodpercben (ffprobe)."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_path
+    ]
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore").strip()
+    return float(out)
+
+
+def export_chunk(input_path: str, start_sec: float, duration_sec: float, out_path: str):
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_sec),
+        "-t", str(duration_sec),
+        "-i", input_path,
+        "-ac", "1",            # mono
+        "-ar", "16000",        # 16 kHz
+        "-b:a", "64k",         # kbps
+        out_path
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def transcribe_file(client: OpenAI, file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        resp = client.audio.transcriptions.create(
+            model=MODEL,
+            file=f,
+            language=LANGUAGE,
+        )
+    return getattr(resp, "text", str(resp))
+
+
+def main():
+    
+    global AUDIO_FILE
+    if len(sys.argv) > 1:
+        AUDIO_FILE = sys.argv[1]
+
+    # ellenőrzések
+    which_or_die("ffprobe")
+    which_or_die("ffmpeg")
+    if not os.path.exists(AUDIO_FILE):
+        print(f"❌ Hiba: nem található a hangfájl: {AUDIO_FILE}")
+        sys.exit(1)
+
+    # OpenAI kliens
+    api_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
+    if not api_key or api_key.startswith("sk-IDE"):
+        print("❌ Hiba: nincs beállítva OPENAI_API_KEY. Állítsd be a fájl tetején vagy környezeti változóban.")
+        sys.exit(1)
+    client = OpenAI(api_key=api_key)
+
+    # hossz lekérdezése és szeletelés
+    total_sec = get_duration_seconds(AUDIO_FILE)
+    chunk_sec = CHUNK_MINUTES * 60
+    num_chunks = int(math.ceil(total_sec / chunk_sec))
+    print(f"🎧 Fájl: {AUDIO_FILE}")
+    print(f"⏱ Hossz: {int(total_sec // 60)} perc {int(total_sec % 60)} mp — {num_chunks} × {CHUNK_MINUTES} perc szelet")
+
+    all_text_parts = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(num_chunks):
+            start = i * chunk_sec
+            dur = min(chunk_sec, total_sec - start)
+            out_path = os.path.join(tmpdir, f"chunk_{i:03d}.mp3")
+            print(f"➡️  {i+1}/{num_chunks}: kivágás {start:.0f}s–{start+dur:.0f}s ...", end="", flush=True)
+            try:
+                export_chunk(AUDIO_FILE, start, dur, out_path)
+                text = transcribe_file(client, out_path)
+                all_text_parts.append(f"\n\n--- {i+1}. rész ({int(start//60):02d}:{int(start%60):02d}–{int((start+dur)//60):02d}:{int((start+dur)%60):02d}) ---\n{text.strip()}")
+                print(" OK")
+            except subprocess.CalledProcessError as e:
+                print(" FFmpeg hiba")
+                print(e)
+            except Exception as e:
+                print(" API hiba")
+                print(e)
+
+    # mentés TXT-be
+    final_text = "".join(all_text_parts).strip()
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(final_text)
+
+    print(f"\n✅ Kész! Mentve: {os.path.abspath(OUTPUT_FILE)}")
+
+
+if __name__ == "__main__":
+    main()
